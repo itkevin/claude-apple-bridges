@@ -185,6 +185,8 @@ mail-bridge read <index> [mailbox] [account] --raw                             R
 mail-bridge read --mid <message-id> [account] [--mark-read] [--raw]            Read by RFC822 message-id (no listing needed) — fetches full body
 mail-bridge send <to> <subject> <body> [/attachment] [--from <email>]          Opens compose window — user reviews and sends manually
 mail-bridge send <to> <subject> <body> [/attachment] [--from <email>] --force  Sends directly without UI
+mail-bridge send <to> <subject> <body> --md   |   send <to> <subject> --md-file <path>   Markdown body → HTML, set directly (no copy-paste; works with --force)
+mail-bridge reply --mid <id> [--body <md> | --body-file <path>] [--reply-all]   Open a formatted reply (markdown→rich text) pasted into Mail; review & send manually
 mail-bridge delete <index> [mailbox] [account] [--force]                       Move to Trash (dry-run without --force)
 ```
 
@@ -248,7 +250,40 @@ mail-bridge send heiko@web.de "Betreff" "Hallo Heiko, ..." --force
 
 # With attachment and explicit sender:
 mail-bridge send heiko@web.de "Report" "See attached." /tmp/report.pdf --from work@company.com --force
+
+# Markdown body → rendered HTML, set directly (no copy-paste, --force works):
+mail-bridge send heiko@web.de "Update" "Hi **Heiko**, see [the doc](https://x.y)." --md --force
+mail-bridge send heiko@web.de "Update" --md-file /tmp/update.md --force
 ```
+
+`--md`/`--md-file` convert markdown to HTML and set it as the message body
+directly (Mail `html content`) — headings, lists, and inline
+bold/italic/strikethrough/code/links, with all body text HTML-escaped. Unlike
+`reply` (which pastes RTF), this path needs no Accessibility/Automation grant.
+
+**Reply examples:**
+
+`reply` opens Mail's native reply window for a message located by `--mid` (from
+`search` output), so the quoted original, recipients, subject, and threading
+headers are preserved. Your markdown body is rendered to rich text and pasted
+in; the window is left open for you to review and send manually.
+
+```bash
+# Formatted reply (markdown bold/italic/links render as rich text):
+mail-bridge reply --mid "abc123@example.com" --body "Hi **Heiko**, sounds good — see [the doc](https://x.y)."
+
+# Reply-all from a file:
+mail-bridge reply --mid "abc123@example.com" --body-file /tmp/reply.md --reply-all
+
+# Body piped on stdin:
+echo "Thanks, **will do**." | mail-bridge reply --mid "abc123@example.com"
+```
+
+Body precedence is `--body` > `--body-file` > stdin. Inline markdown
+(bold/italic/strikethrough/inline-code/links) renders reliably; headings and
+lists are weakly represented. The **first run prompts for Accessibility access**
+(needed to paste the formatted text via ⌘V) — grant it in System Settings →
+Privacy & Security → Accessibility, then re-run. Read/send commands don't need it.
 
 ### tmux-bridge
 Read and write tmux session contents from Claude Code — great for end-of-day summaries and interactive terminal control.
@@ -382,6 +417,8 @@ Run each binary once from Terminal to trigger the macOS permission dialog:
 ```
 
 Then approve in **System Settings → Privacy & Security → Reminders / Calendars / Contacts / Automation**. Notes and Mail access is granted automatically via AppleScript on first use.
+
+`mail-bridge reply` additionally needs two grants (other mail commands need neither): **Accessibility** access (to paste the formatted reply via ⌘V) — approve in **System Settings → Privacy & Security → Accessibility → mail-bridge** — and **Automation → System Events** access (to detect when the reply window opens), which is prompted on the first `reply` run. If either is missing, `reply` aborts with a message pointing to the right setting. Grant both, then re-run.
 
 ### 3. Add to Claude Code allowed tools
 

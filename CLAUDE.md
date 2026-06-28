@@ -93,6 +93,47 @@ Supported tags: `<b>`, `<i>`, `<u>`, `<br>`, `<ul>`, `<ol>`, `<li>`, `<h1>`–`<
 - **Without `--force`**: opens Mail.app compose window — user reviews and sends manually
 - **With `--force`**: sends directly without UI (use only when explicitly requested)
 
+### Markdown body (`--md` / `--md-file`)
+
+`send` can take a **markdown** body, converted to HTML and delivered directly as
+Mail's `html content` — no clipboard, no GUI paste, works headless with `--force`.
+
+```bash
+mail-bridge send to@x.y "Subject" "Hi **there**, see [doc](https://x.y)." --md
+mail-bridge send to@x.y "Subject" --md-file /tmp/body.md --force
+```
+
+- `--md` treats the positional `<body>` as markdown; `--md-file <path>` reads it
+  from a file. Either takes precedence over a plain body.
+- Supports headings, ordered/unordered lists, paragraphs, and inline
+  bold/italic/strikethrough/inline-code/links. All body text is HTML-escaped.
+- This is the **direct (`html content`) path** — distinct from `reply`, which
+  renders to RTF and pastes. Needs no Accessibility/Automation grant.
+
+## mail-bridge: Reply Behavior
+
+`reply` opens Mail's native reply window for a message located
+by `--mid`, so the quoted original, recipients, subject, and threading headers
+are preserved (never overwritten). The markdown body is rendered to rich text
+(`AttributedString` → RTF) and pasted via ⌘V; the window is left open for
+manual review/send — no auto-save, no auto-send.
+
+```bash
+mail-bridge reply --mid "abc123@example.com" --body "Hi **there**, see [doc](https://x.y)."
+mail-bridge reply --mid "abc123@example.com" --body-file /tmp/reply.md --reply-all
+echo "Thanks, **will do**." | mail-bridge reply --mid "abc123@example.com"
+```
+
+- Body precedence: `--body` > `--body-file` > stdin.
+- Inline markdown (bold/italic/strikethrough/inline-code/links) renders reliably;
+  headings/lists are weakly represented (inline-only RTF rendering).
+- Requires two one-time grants (read/send commands need neither):
+  - **Accessibility** (System Settings → Privacy & Security → Accessibility →
+    mail-bridge) to post the ⌘V keystroke.
+  - **Automation → System Events** (prompted on first `reply`) — used to detect
+    when the reply window opens. If it's missing, `reply` aborts with a message
+    pointing here rather than failing silently.
+
 ## Adding a New Bridge
 
 1. Create `<name>-bridge.swift` in repo root

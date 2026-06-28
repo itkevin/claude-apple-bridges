@@ -12,10 +12,16 @@
 //   mail-bridge read <index> [mailbox] [account]       - Read message by index
 //   mail-bridge read --mid <message-id> [account]      - Read by RFC822 message-id (from search output)
 //   mail-bridge send <to> <subject> <body>             - Send a new email (plain text)
+//   mail-bridge send <to> <subject> <body> --md         - Send markdown body as HTML (no copy-paste)
+//   mail-bridge send <to> <subject> --md-file <path>    - Send markdown file as HTML
 //   mail-bridge send <to> <subject> --html-file <path>  - Send HTML email from file
+//   mail-bridge reply --mid <message-id> --body <md>    - Open a formatted reply (markdown→rich text)
 //   mail-bridge delete <index> [mailbox] [account] [--force]  - Move message to Trash
 
 import Foundation
+import AppKit              // NSPasteboard, NSAttributedString, RTF export
+import ApplicationServices // AXIsProcessTrusted(WithOptions), kAXTrustedCheckOptionPrompt
+import CoreGraphics        // CGEvent / CGEventSource for the ⌘V paste
 
 // MARK: - String Helpers
 
@@ -429,6 +435,127 @@ func getDefaultSenderEmail() -> String {
     return result?.stringValue ?? ""
 }
 
+// MARK: - Markdown → HTML (for `send`, delivered as Mail `html content`)
+
+// Unlike the reply path (which renders to RTF and pastes), `send` can set a
+// message's `html content` directly via AppleScript — no clipboard, no GUI,
+// works headless with --force. So markdown is converted to HTML here. Inline
+// styling reuses Apple's markdown parser (the same intents the RTF path
+// resolves); only the block structure (headings/lists/paragraphs) is handled
+// directly. All user text is HTML-escaped, so the body can't break the markup.
+
+func htmlEscape(_ s: String) -> String {
+    s.replacingOccurrences(of: "&", with: "&amp;")
+        .replacingOccurrences(of: "<", with: "&lt;")
+        .replacingOccurrences(of: ">", with: "&gt;")
+}
+
+// Render one line of inline markdown (bold/italic/strikethrough/code/links) to
+// inline HTML. Falls back to escaped plain text if the parser can't handle it.
+func inlineMarkdownToHTML(_ line: String) -> String {
+    if line.isEmpty { return "" }
+    var options = AttributedString.MarkdownParsingOptions()
+    options.interpretedSyntax = .inlineOnlyPreservingWhitespace
+    guard let attributed = try? AttributedString(markdown: line, options: options) else {
+        return htmlEscape(line)
+    }
+    let ns = NSAttributedString(attributed)
+    let intentKey = NSAttributedString.Key("NSInlinePresentationIntent")
+    var html = ""
+    ns.enumerateAttributes(in: NSRange(location: 0, length: ns.length)) { attrs, range, _ in
+        var inner = htmlEscape((ns.string as NSString).substring(with: range))
+        var raw: UInt? = nil
+        if let n = attrs[intentKey] as? UInt { raw = n }
+        else if let n = attrs[intentKey] as? NSNumber { raw = n.uintValue }
+        if let raw = raw {
+            let intent = InlinePresentationIntent(rawValue: raw)
+            if intent.contains(.code) { inner = "<code>\(inner)</code>" }
+            if intent.contains(.strikethrough) { inner = "<s>\(inner)</s>" }
+            if intent.contains(.emphasized) { inner = "<em>\(inner)</em>" }
+            if intent.contains(.stronglyEmphasized) { inner = "<strong>\(inner)</strong>" }
+        }
+        if let url = attrs[.link] as? URL {
+            inner = "<a href=\"\(htmlEscape(url.absoluteString))\">\(inner)</a>"
+        } else if let urlStr = attrs[.link] as? String {
+            inner = "<a href=\"\(htmlEscape(urlStr))\">\(inner)</a>"
+        }
+        html += inner
+    }
+    return html
+}
+
+// Heading "# .. ###### " → (level, text); nil if not a heading.
+func parseHeading(_ line: String) -> (level: Int, text: String)? {
+    var level = 0
+    for ch in line { if ch == "#" { level += 1 } else { break } }
+    guard level >= 1, level <= 6 else { return nil }
+    let after = line.index(line.startIndex, offsetBy: level)
+    guard after < line.endIndex, line[after] == " " else { return nil }
+    return (level, String(line[after...]).trimmingCharacters(in: .whitespaces))
+}
+
+// "- ", "* ", "+ " item → its text; nil otherwise.
+func unorderedItemText(_ line: String) -> String? {
+    for marker in ["- ", "* ", "+ "] where line.hasPrefix(marker) {
+        return String(line.dropFirst(marker.count)).trimmingCharacters(in: .whitespaces)
+    }
+    return nil
+}
+
+// "1. " / "2) " item → its text; nil otherwise.
+func orderedItemText(_ line: String) -> String? {
+    var idx = line.startIndex
+    var sawDigit = false
+    while idx < line.endIndex, line[idx].isNumber { sawDigit = true; idx = line.index(after: idx) }
+    guard sawDigit, idx < line.endIndex, line[idx] == "." || line[idx] == ")" else { return nil }
+    let next = line.index(after: idx)
+    guard next < line.endIndex, line[next] == " " else { return nil }
+    return String(line[next...]).trimmingCharacters(in: .whitespaces)
+}
+
+// Convert a markdown document to a small HTML document for Mail's html content.
+func markdownToHTML(_ markdown: String) -> String {
+    let lines = markdown.replacingOccurrences(of: "\r\n", with: "\n").components(separatedBy: "\n")
+    var out = ""
+    var paragraph: [String] = []
+    func flushParagraph() {
+        if !paragraph.isEmpty {
+            out += "<p>" + paragraph.joined(separator: "<br>\n") + "</p>\n"
+            paragraph.removeAll()
+        }
+    }
+    var i = 0
+    while i < lines.count {
+        let line = lines[i].trimmingCharacters(in: .whitespaces)
+        if line.isEmpty { flushParagraph(); i += 1; continue }
+        if let h = parseHeading(line) {
+            flushParagraph()
+            out += "<h\(h.level)>\(inlineMarkdownToHTML(h.text))</h\(h.level)>\n"
+            i += 1; continue
+        }
+        if unorderedItemText(line) != nil {
+            flushParagraph()
+            out += "<ul>\n"
+            while i < lines.count, let t = unorderedItemText(lines[i].trimmingCharacters(in: .whitespaces)) {
+                out += "<li>\(inlineMarkdownToHTML(t))</li>\n"; i += 1
+            }
+            out += "</ul>\n"; continue
+        }
+        if orderedItemText(line) != nil {
+            flushParagraph()
+            out += "<ol>\n"
+            while i < lines.count, let t = orderedItemText(lines[i].trimmingCharacters(in: .whitespaces)) {
+                out += "<li>\(inlineMarkdownToHTML(t))</li>\n"; i += 1
+            }
+            out += "</ol>\n"; continue
+        }
+        paragraph.append(inlineMarkdownToHTML(line))
+        i += 1
+    }
+    flushParagraph()
+    return "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body>\n\(out)</body></html>"
+}
+
 func sendMessage(to recipient: String, subject: String, body: String, attachmentPaths: [String], fromEmail: String, force: Bool, htmlFilePath: String) {
     for path in attachmentPaths {
         if !FileManager.default.fileExists(atPath: path) {
@@ -493,6 +620,424 @@ func sendMessage(to recipient: String, subject: String, body: String, attachment
     }
 }
 
+// MARK: - Reply (rich-text paste)
+
+// Mail treats a reply's body as read-only — setting `content` destroys the
+// quoted original. The only reliable way to get markdown-rendered rich text
+// into a *threaded* reply is to open Mail's native reply window (which keeps
+// the quote, recipients, subject, and threading headers) and paste an
+// NSAttributedString onto it via the clipboard + a synthetic ⌘V.
+//
+// This path needs Accessibility permission (to post the keystroke); reading
+// commands are unaffected. The window is left open for manual review/send.
+
+// Markdown → NSAttributedString → RTF Data. Exits(1) on failure.
+func makeRTF(fromMarkdown markdown: String) -> Data {
+    let attributed: AttributedString
+    do {
+        var options = AttributedString.MarkdownParsingOptions()
+        // Required: without this, newlines collapse and only the first
+        // paragraph survives (the default initializer drops whitespace).
+        options.interpretedSyntax = .inlineOnlyPreservingWhitespace
+        attributed = try AttributedString(markdown: markdown, options: options)
+    } catch {
+        fputs("Failed to parse markdown body: \(error.localizedDescription)\n", stderr)
+        exit(1)
+    }
+    // AttributedString's markdown parser records inline styling as a *semantic*
+    // attribute (NSInlinePresentationIntent), not concrete font/strikethrough
+    // attributes. The RTF writer only understands concrete attributes, so bold/
+    // italic/strikethrough/code would silently vanish. Resolve the intents into
+    // real NSFont traits + strikethrough before serializing. (Links survive on
+    // their own — NSLink is already a concrete attribute.)
+    let mutable = NSMutableAttributedString(attributedString: NSAttributedString(attributed))
+    let range = NSRange(location: 0, length: mutable.length)
+
+    let baseSize: CGFloat = 13
+    let baseFont = NSFont.systemFont(ofSize: baseSize)
+    let monoFont = NSFont.monospacedSystemFont(ofSize: baseSize, weight: .regular)
+    let fontManager = NSFontManager.shared
+    mutable.addAttribute(.font, value: baseFont, range: range)
+
+    let intentKey = NSAttributedString.Key("NSInlinePresentationIntent")
+    mutable.enumerateAttribute(intentKey, in: range) { value, runRange, _ in
+        let raw: UInt
+        if let n = value as? UInt { raw = n }
+        else if let n = value as? NSNumber { raw = n.uintValue }
+        else { return }
+        let intent = InlinePresentationIntent(rawValue: raw)
+        var font = intent.contains(.code) ? monoFont : baseFont
+        if intent.contains(.stronglyEmphasized) { font = fontManager.convert(font, toHaveTrait: .boldFontMask) }
+        if intent.contains(.emphasized) { font = fontManager.convert(font, toHaveTrait: .italicFontMask) }
+        mutable.addAttribute(.font, value: font, range: runRange)
+        if intent.contains(.strikethrough) {
+            mutable.addAttribute(.strikethroughStyle, value: NSUnderlineStyle.single.rawValue, range: runRange)
+        }
+        mutable.removeAttribute(intentKey, range: runRange)
+    }
+
+    guard let data = try? mutable.data(
+        from: range,
+        documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf]
+    ) else {
+        fputs("Failed to render reply body to RTF.\n", stderr)
+        exit(1)
+    }
+    return data
+}
+
+// Fail fast if Accessibility is not granted (needed to post ⌘V). Prompts once.
+func ensureAccessibilityOrExit() {
+    if AXIsProcessTrusted() { return }
+    let promptKey = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
+    let options: CFDictionary = [promptKey: true] as CFDictionary
+    if AXIsProcessTrustedWithOptions(options) { return }
+    fputs("""
+    Accessibility permission required.
+
+    mail-bridge needs Accessibility access to paste the formatted reply into
+    Mail's compose window (it sends a Cmd-V keystroke).
+
+    Grant it here:
+      System Settings → Privacy & Security → Accessibility → enable "mail-bridge"
+
+    Open directly:
+      open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+
+    Then re-run the same command.
+    """, stderr)
+    exit(1)
+}
+
+// Snapshot of the general pasteboard so we can restore the user's clipboard.
+struct ClipboardSnapshot {
+    let items: [(type: NSPasteboard.PasteboardType, data: Data)]
+
+    static func capture() -> ClipboardSnapshot {
+        let pb = NSPasteboard.general
+        var captured: [(NSPasteboard.PasteboardType, Data)] = []
+        if let types = pb.types {
+            for type in types {
+                if let data = pb.data(forType: type) {
+                    captured.append((type, data))
+                }
+            }
+        }
+        return ClipboardSnapshot(items: captured)
+    }
+
+    func restore() {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        guard !items.isEmpty else { return } // was empty before — leave it empty
+        pb.declareTypes(items.map { $0.type }, owner: nil)
+        // clearContents() already wiped the user's clipboard; if a write-back
+        // fails, their previous contents are gone, so warn instead of silently
+        // leaving them with less than they started.
+        var ok = true
+        for (type, data) in items {
+            if !pb.setData(data, forType: type) { ok = false }
+        }
+        if !ok {
+            fputs("Warning: could not fully restore your previous clipboard contents.\n", stderr)
+        }
+    }
+}
+
+// Write RTF (richest) + plain-text fallback + a transient marker so clipboard
+// managers ignore our temporary entry. Returns false if the RTF write failed —
+// pasting then would land empty/stale, so the caller must not proceed.
+func writeRTFToPasteboard(_ rtf: Data, plainTextFallback: String) -> Bool {
+    let pb = NSPasteboard.general
+    pb.clearContents()
+    let transient = NSPasteboard.PasteboardType("org.nspasteboard.TransientType")
+    pb.declareTypes([.rtf, .string, transient], owner: nil)
+    let rtfOK = pb.setData(rtf, forType: .rtf)
+    pb.setString(plainTextFallback, forType: .string)
+    pb.setString("", forType: transient)
+    return rtfOK
+}
+
+// Count Mail's top-level windows via System Events. Returns nil on error
+// (e.g. the System Events Automation grant is missing, or the query times out)
+// so callers never confuse "couldn't query" with a concrete count.
+func mailComposeWindowCount() -> Int? {
+    let result = runScript("""
+        with timeout of 10 seconds
+            tell application "System Events"
+                if not (exists process "Mail") then return "0"
+                return (count of windows of process "Mail") as text
+            end tell
+        end timeout
+    """)
+    guard let s = result?.stringValue, let n = Int(s) else { return nil }
+    return n
+}
+
+// Locate the original by message-id (across all accounts) and open Mail's
+// native reply window. Exits(1) on not-found or AppleScript error.
+func openReplyWindow(messageId: String, replyAll: Bool) {
+    let escapedMid = escapeForAppleScript(messageId)
+    // The `and` is mandatory — "with opening window reply to all" is a -2741 error.
+    let replyVerb = replyAll
+        ? "reply bestMsg with opening window and reply to all"
+        : "reply bestMsg with opening window"
+    let result = runScript("""
+        with timeout of 30 seconds
+            tell application "Mail"
+                -- A message-id can resolve to several copies (the received
+                -- INBOX copy, a Sent copy on the sending account, a flagged/
+                -- Starred copy, …). Replying on the wrong one picks the wrong
+                -- From account (e.g. the Sent copy makes Mail reply *as* the
+                -- sender, addressed back to yourself). So we identify the copy
+                -- in the account that actually received the mail (owns an
+                -- address in the original To/Cc), preferring INBOX over
+                -- Sent/Drafts/Junk/Trash, and reply on that one.
+                set bestMsg to missing value
+                set bestAcct to missing value
+                set bestScore to -1
+                set origRcpts to {}
+                set haveRcpts to false
+                set searchErr to ""
+                set warnings to ""
+
+                -- Fast path: Mail's unified `inbox` is kept synced, so a single
+                -- query across all account inboxes covers the common case
+                -- (replying to a received message) without sweeping every
+                -- server-side mailbox of every account — which is slow on IMAP.
+                try
+                    set inboxCands to (messages of inbox whose message id is "\(escapedMid)")
+                    repeat with m in inboxCands
+                        if not haveRcpts then
+                            try
+                                set origRcpts to (address of every to recipient of m) & (address of every cc recipient of m)
+                                set haveRcpts to true
+                            end try
+                        end if
+                        set acc to account of (mailbox of m)
+                        set sc to 6 -- in an INBOX: +4 INBOX, +2 non-Sent
+                        try
+                            repeat with a in (email addresses of acc)
+                                if (a as text) is in origRcpts then
+                                    set sc to sc + 8
+                                    exit repeat
+                                end if
+                            end repeat
+                        end try
+                        if sc > bestScore then
+                            set bestScore to sc
+                            set bestMsg to m
+                            set bestAcct to acc
+                        end if
+                    end repeat
+                end try
+
+                -- Fallback: not in any inbox (e.g. filed into a subfolder) —
+                -- sweep every mailbox of every account and score each copy.
+                if bestMsg is missing value then
+                    repeat with acc in accounts
+                        set acctAddrs to {}
+                        try
+                            set acctAddrs to email addresses of acc
+                        end try
+                        repeat with mb in (every mailbox of acc)
+                            try
+                                set candidates to (messages of mb whose message id is "\(escapedMid)")
+                                if (count of candidates) > 0 then
+                                    set m to item 1 of candidates
+                                    if not haveRcpts then
+                                        try
+                                            set origRcpts to (address of every to recipient of m) & (address of every cc recipient of m)
+                                            set haveRcpts to true
+                                        end try
+                                    end if
+                                    set sc to 0
+                                    set mbName to (name of mb)
+                                    if mbName is "INBOX" then set sc to sc + 4
+                                    if mbName is not "Drafts" and mbName does not contain "Sent" and mbName does not contain "Junk" and mbName does not contain "Trash" then set sc to sc + 2
+                                    repeat with a in acctAddrs
+                                        if (a as text) is in origRcpts then
+                                            set sc to sc + 8
+                                            exit repeat
+                                        end if
+                                    end repeat
+                                    if sc > bestScore then
+                                        set bestScore to sc
+                                        set bestMsg to m
+                                        set bestAcct to acc
+                                    end if
+                                end if
+                            on error errMsg
+                                set searchErr to errMsg
+                            end try
+                        end repeat
+                    end repeat
+                end if
+
+                if bestMsg is missing value then
+                    if searchErr is not "" then return "SEARCH_ERROR: " & searchErr
+                    return "MID_NOT_FOUND"
+                end if
+                -- A copy was found, but a mailbox errored during the sweep, so a
+                -- higher-scoring copy elsewhere may have been skipped — the chosen
+                -- copy (hence From account) may not be the best one. Warn, don't hide.
+                if searchErr is not "" then
+                    set warnings to warnings & "Some mailboxes could not be searched (" & searchErr & "); the chosen reply copy may not be the best one — verify the From field before sending. "
+                end if
+                -- The original recipients never resolved, so the From account was
+                -- scored by mailbox name alone (the +8 \"received here\" signal was
+                -- lost) and may be wrong.
+                if not haveRcpts then
+                    set warnings to warnings & "Could not read the original recipients, so the From account was chosen by mailbox only and may be wrong — verify the From field before sending. "
+                end if
+                set newReply to (\(replyVerb))
+                -- Send FROM the receiving account, not Mail's default. Prefer the
+                -- bestAcct address that was actually addressed (handles aliases);
+                -- fall back to that account's primary address.
+                try
+                    set senderAddr to ""
+                    set acctAddrs to email addresses of bestAcct
+                    if acctAddrs is not missing value and (count of acctAddrs) > 0 then
+                        repeat with a in acctAddrs
+                            if (a as text) is in origRcpts then
+                                set senderAddr to (a as text)
+                                exit repeat
+                            end if
+                        end repeat
+                        if senderAddr is "" then set senderAddr to ((item 1 of acctAddrs) as text)
+                        if senderAddr is not "" then set sender of newReply to senderAddr
+                    else
+                        set warnings to warnings & "Could not determine the receiving account's send address; the reply uses Mail's default From — verify it before sending. "
+                    end if
+                on error errMsg
+                    -- Setting the From to the receiving identity failed (often an
+                    -- alias that isn't a configured send-from address). Don't let
+                    -- the reply go out from the wrong account unannounced.
+                    set warnings to warnings & "Could not set the From account to the receiving identity (" & errMsg & "); verify the From field before sending. "
+                end try
+                activate
+                if warnings is not "" then return "REPLY_OPENED ||WARN|| " & warnings
+                return "REPLY_OPENED"
+            end tell
+        end timeout
+    """)
+    guard let status = result?.stringValue else {
+        fputs("Failed to open reply window.\n", stderr)
+        exit(1)
+    }
+    if status.hasPrefix("SEARCH_ERROR:") {
+        let detail = String(status.dropFirst("SEARCH_ERROR:".count)).trimmingCharacters(in: .whitespaces)
+        fputs("Could not search every mailbox for message id \(messageId): \(detail)\n", stderr)
+        fputs("The message may live in a mailbox that is offline or mid-sync — check the account is online and try again.\n", stderr)
+        exit(1)
+    }
+    if status == "MID_NOT_FOUND" {
+        fputs("Message with id \(messageId) not found in any mailbox.\n", stderr)
+        exit(1)
+    }
+    if status.hasPrefix("REPLY_OPENED") {
+        // The reply opened, but the script may have appended non-fatal warnings
+        // (after a "||WARN||" marker) about a possibly-wrong From account — the
+        // window stays open for review, so surface them rather than letting a
+        // silently mis-addressed reply slip past.
+        if let r = status.range(of: "||WARN||") {
+            let warn = String(status[r.upperBound...]).trimmingCharacters(in: .whitespaces)
+            if !warn.isEmpty { fputs("Warning: \(warn)\n", stderr) }
+        }
+        return
+    }
+    fputs("Unexpected reply status: \(status)\n", stderr)
+    exit(1)
+}
+
+// Bounded poll: true as soon as Mail has more windows than before, else false
+// after timeout — reacting the moment the window exists rather than waiting a
+// fixed interval. Errored polls (nil) are treated as "unknown" and skipped, so
+// a transient System Events failure can never be read as a new window.
+func waitForNewComposeWindow(afterCount: Int, timeout: Double) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if let count = mailComposeWindowCount(), count > afterCount { return true }
+        usleep(200_000) // poll every 200ms
+    }
+    return false
+}
+
+// Post ⌘V via CGEvent; fall back to System Events keystroke. Returns whether
+// the keystroke was dispatched (not whether text actually landed).
+func sendCommandV() -> Bool {
+    let kVK_ANSI_V: CGKeyCode = 0x09
+    if let source = CGEventSource(stateID: .combinedSessionState),
+       let keyDown = CGEvent(keyboardEventSource: source, virtualKey: kVK_ANSI_V, keyDown: true),
+       let keyUp = CGEvent(keyboardEventSource: source, virtualKey: kVK_ANSI_V, keyDown: false) {
+        keyDown.flags = .maskCommand
+        keyUp.flags = .maskCommand
+        keyDown.post(tap: .cghidEventTap)
+        usleep(20_000)
+        keyUp.post(tap: .cghidEventTap)
+        return true
+    }
+    // Fallback: System Events keystroke (also requires the Accessibility grant).
+    let result = runScript("""
+        with timeout of 10 seconds
+            tell application "System Events"
+                keystroke "v" using command down
+            end tell
+        end timeout
+    """)
+    return result != nil
+}
+
+func replyMessage(messageId: String, markdownBody: String, replyAll: Bool) {
+    ensureAccessibilityOrExit()                       // fail fast if no AX grant
+    let rtfData = makeRTF(fromMarkdown: markdownBody) // parse markdown → RTF (may exit)
+
+    // Window count BEFORE reply. nil means System Events couldn't be reached —
+    // almost always a missing Automation grant — so surface that precisely
+    // instead of letting it later masquerade as "window never appeared".
+    guard let beforeCount = mailComposeWindowCount() else {
+        fputs("""
+        Could not query Mail's windows via System Events. Nothing was pasted.
+
+        mail-bridge needs Automation access to System Events to detect when the
+        reply window opens. Grant it in:
+          System Settings → Privacy & Security → Automation → mail-bridge → enable "System Events"
+
+        Then re-run the same command.
+        """, stderr)
+        exit(1)
+    }
+    openReplyWindow(messageId: messageId, replyAll: replyAll) // may exit: MID_NOT_FOUND
+
+    guard waitForNewComposeWindow(afterCount: beforeCount, timeout: 10.0) else {
+        fputs("Reply window did not appear within 10s. Nothing was pasted.\n", stderr)
+        exit(1)
+    }
+
+    // Window exists. Only now do we touch the clipboard.
+    let snapshot = ClipboardSnapshot.capture()
+    guard writeRTFToPasteboard(rtfData, plainTextFallback: markdownBody) else {
+        snapshot.restore()
+        fputs("Failed to place the formatted reply on the clipboard. The reply window is open, but nothing was pasted.\n", stderr)
+        exit(1)
+    }
+    usleep(200_000) // settle — let the GUI focus the body field before ⌘V
+    let pasted = sendCommandV()
+
+    if pasted {
+        usleep(250_000)    // let the paste land before mutating the clipboard
+        snapshot.restore()
+        // sendCommandV only confirms the keystroke was dispatched, not that it
+        // landed in the body field — so guide the user to verify rather than
+        // asserting the paste succeeded.
+        print("Reply window opened in Mail and the formatted text was pasted in — review the body and send manually. (If the body looks empty, the paste missed; re-run this command.)")
+    } else {
+        // Skip restore: leave the formatted text on the clipboard for manual ⌘V.
+        fputs("Reply window opened, but automatic paste failed. The formatted reply is on your clipboard — click the body and press Cmd-V, then review and send.\n", stderr)
+        exit(1)
+    }
+}
+
 func deleteMessage(index: Int, mailbox: String, account: String, force: Bool) {
     if !force {
         print("Dry-run: would move message #\(index) in '\(mailbox)' to Trash. Use --force to actually delete.")
@@ -538,7 +1083,8 @@ guard args.count >= 2 else {
     print("  mail-bridge search <query> [max_results] [account] [--unread] [--since <Nd|YYYY-MM-DD>] [--max N]")
     print("  mail-bridge read <index> [mailbox] [account] [--mark-read] [--raw]")
     print("  mail-bridge read --mid <message-id> [account] [--mark-read] [--raw]")
-    print("  mail-bridge send <to> <subject> <body> [/path/to/attachment ...] [--from <email>] [--html-file <path>] [--force]")
+    print("  mail-bridge send <to> <subject> <body> [/path/to/attachment ...] [--from <email>] [--html-file <path> | --md | --md-file <path>] [--force]")
+    print("  mail-bridge reply --mid <message-id> [--body <md> | --body-file <path>] [--reply-all]   (or pipe md on stdin)")
     print("  mail-bridge delete <index> [mailbox] [account] [--force]")
     exit(0)
 }
@@ -720,19 +1266,90 @@ case "send":
     if let htmlIdx = args.firstIndex(of: "--html-file"), htmlIdx + 1 < args.count {
         htmlFilePath = args[htmlIdx + 1]
     }
-    // With --html-file, body is optional (only to/subject required)
+    // Markdown → HTML, delivered directly as Mail `html content` (no copy-paste,
+    // works headless with --force). --md treats the positional body as markdown;
+    // --md-file reads markdown from a file. Either takes precedence over plain
+    // body; the converted HTML is staged in a temp file reusing the html path.
+    var mdFilePath = ""
+    var markdownSource: String? = nil
+    if let mdIdx = args.firstIndex(of: "--md-file"), mdIdx + 1 < args.count {
+        mdFilePath = args[mdIdx + 1]
+        guard let contents = try? String(contentsOfFile: mdFilePath, encoding: .utf8) else {
+            fputs("Markdown file not found or unreadable: \(mdFilePath)\n", stderr)
+            exit(1)
+        }
+        markdownSource = contents
+    } else if args.contains("--md") {
+        // Positional body is markdown — but only if it's actually present and
+        // not itself a flag (e.g. `send to subj --md` has no body at args[4]).
+        markdownSource = (args.count >= 5 && !args[4].hasPrefix("--")) ? args[4] : ""
+    }
+    var tempHTMLPath = ""
+    if let md = markdownSource {
+        guard !md.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            fputs("No markdown body provided. Use --md with a body, or --md-file <path>.\n", stderr)
+            exit(1)
+        }
+        tempHTMLPath = NSTemporaryDirectory() + "mail-bridge-send-\(ProcessInfo.processInfo.globallyUniqueString).html"
+        do {
+            try markdownToHTML(md).write(toFile: tempHTMLPath, atomically: true, encoding: .utf8)
+        } catch {
+            fputs("Failed to prepare HTML body: \(error.localizedDescription)\n", stderr)
+            exit(1)
+        }
+        htmlFilePath = tempHTMLPath
+        // sendMessage() calls exit() on its error paths, which bypasses defer —
+        // so register the cleanup with atexit_b to remove the staged HTML body
+        // (the email content) on every exit path, success or failure.
+        let cleanupPath = tempHTMLPath
+        atexit_b { try? FileManager.default.removeItem(atPath: cleanupPath) }
+    }
+    // With --html-file / --md / --md-file, body is optional (only to/subject required)
     let minArgs = htmlFilePath.isEmpty ? 5 : 4
     guard args.count >= minArgs else {
-        fputs("Usage: mail-bridge send <to> <subject> [body] [/path/to/attachment ...] [--from <email>] [--html-file <path>] [--force]\n", stderr)
+        fputs("Usage: mail-bridge send <to> <subject> [body] [/path/to/attachment ...] [--from <email>] [--html-file <path> | --md | --md-file <path>] [--force]\n", stderr)
         exit(1)
     }
     let body = args.count >= 5 ? args[4] : ""
-    let flagArgs = Set(["--force", "--from", fromEmail, "--html-file", htmlFilePath].filter { !$0.isEmpty })
+    let flagArgs = Set(["--force", "--from", fromEmail, "--html-file", htmlFilePath, "--md", "--md-file", mdFilePath].filter { !$0.isEmpty })
     // Alle positionalen Args nach to/subject/body sind Attachment-Pfade
     // (mehrere möglich, z.B. `send to subj body f1.pdf f2.pdf f3.pdf --force`).
     let positional = args.dropFirst(min(5, args.count)).filter { !flagArgs.contains($0) }
     let attachmentPaths = Array(positional)
     sendMessage(to: args[2], subject: args[3], body: body, attachmentPaths: attachmentPaths, fromEmail: fromEmail, force: force, htmlFilePath: htmlFilePath)
+    // Temp HTML body (if any) is removed by the atexit_b handler registered above,
+    // which also covers sendMessage's exit() error paths.
+
+case "reply":
+    guard let midIdx = args.firstIndex(of: "--mid"), midIdx + 1 < args.count else {
+        fputs("Usage: mail-bridge reply --mid <message-id> [--body <markdown> | --body-file <path>] [--reply-all]\n", stderr)
+        fputs("       (body may also be piped on stdin)\n", stderr)
+        exit(1)
+    }
+    let replyMid = args[midIdx + 1]
+    let replyAll = args.contains("--reply-all")
+    // Body precedence: --body > --body-file > stdin.
+    var replyBody: String? = nil
+    if let bIdx = args.firstIndex(of: "--body"), bIdx + 1 < args.count {
+        replyBody = args[bIdx + 1]
+    } else if let fIdx = args.firstIndex(of: "--body-file"), fIdx + 1 < args.count {
+        let path = args[fIdx + 1]
+        guard let contents = try? String(contentsOfFile: path, encoding: .utf8) else {
+            fputs("Body file not found or unreadable: \(path)\n", stderr)
+            exit(1)
+        }
+        replyBody = contents
+    } else if isatty(FileHandle.standardInput.fileDescriptor) == 0 {
+        // Body piped on stdin (only when stdin is NOT a terminal, else we'd block).
+        let data = FileHandle.standardInput.readDataToEndOfFile()
+        replyBody = String(data: data, encoding: .utf8)
+    }
+    let replyText = (replyBody ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !replyText.isEmpty else {
+        fputs("No reply body provided. Use --body, --body-file, or pipe markdown on stdin.\n", stderr)
+        exit(1)
+    }
+    replyMessage(messageId: replyMid, markdownBody: replyText, replyAll: replyAll)
 
 case "delete":
     guard args.count >= 3, let index = Int(args[2]) else {
